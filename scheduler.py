@@ -739,21 +739,20 @@ def assign_rovers(staff, used, shifts, lunch_counts, prefix):
 
 
 def _pick_named_rover(rovers, primary_lunch, used_relief=None):
+    """Pick a rover who is not already covering this lunch and is not on their own lunch."""
     used_relief = used_relief or set()
-    fallback = None
     for r in rovers:
         name = _norm(r.get("Assigned Employee"))
         if not name:
             continue
+        own_lunch = _norm(r.get("Assigned Lunch"))
+        if own_lunch and own_lunch == _norm(primary_lunch):
+            continue  # rover is at lunch themselves
         key = (name.lower(), _norm(primary_lunch))
         if key in used_relief:
             continue
-        if r.get("Assigned Lunch") and r.get("Assigned Lunch") == primary_lunch:
-            if fallback is None:
-                fallback = r
-            continue
         return r
-    return fallback
+    return None
 
 
 OFFICIAL_SECTIONS = [
