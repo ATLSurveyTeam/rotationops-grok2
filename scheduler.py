@@ -793,3 +793,117 @@ def build_official_sheet(am_board, pm_board, schedule_date, leads=""):
 
     df = pd.DataFrame(out)
     return df
+
+
+def _norm_pos(name: str) -> str:
+    return _norm(name).replace("–", "-").replace("—", "-").replace("  ", " ").lower()
+
+
+def _board_index(board: pd.DataFrame):
+    idx = {}
+    for _, r in board.iterrows():
+        key = (_norm_pos(r.get("Position Name", "")), _norm(r.get("Area")).lower())
+        idx[key] = r
+        idx.setdefault(_norm_pos(r.get("Position Name", "")), r)
+    return idx
+
+
+def _match_official_row(index, section, position):
+    pos = _norm_pos(position)
+    section_l = _norm(section).lower()
+    # try area-aware first
+    for key, row in list(index.items()):
+        if not (isinstance(key, tuple) and len(key) == 2):
+            continue
+        pkey, area = key
+        if pkey != pos:
+            continue
+        if "lower north" in section_l and "lower north" in area:
+            return row
+        if section_l.startswith("north") and "north security" in area and "lower" not in area:
+            return row
+        if "south" in section_l and "south" in area:
+            return row
+        if "main" in section_l and "main" in area:
+            return row
+        if "atrium" in section_l and "atrium" in area:
+            return row
+        if "agt" in section_l and "agt" in area:
+            return row
+        if "survey" in section_l and "survey" in area:
+            return row
+        if "information" in section_l and "information" in area:
+            return row
+        if "divest" in section_l and "divest" in pkey:
+            return row
+    return index.get(pos)
+
+
+def fill_official_docx(template_path: str, am_board: pd.DataFrame, pm_board: pd.DataFrame,
+                       schedule_date, leads: str = "", pax: str = "") -> bytes:
+    from copy import copy
+    from io import BytesIO
+    from docx import Document
+
+    doc = Document(template_path)
+    if isinstance(schedule_date, str):
+        date_text = schedule_date
+    else:
+        date_text = schedule_date.strftime("%A %B %d, %Y")
+
+    if doc.tables:
+        meta = doc.tables[0]
+        if len(meta.rows) >= 1 and len(meta.columns) >= 2:
+            meta.cell(0, 1).text = date_text
+        if len(meta.rows) >= 2 and len(meta.columns) >= 2:
+            meta.cell(1, 1).text = leads or ""
+        if len(meta.rows) >= 3 and len(meta.columns) >= 2:
+            meta.cell(2, 1).text = pax or ""
+
+    am_idx = _board_index(am_board)
+    pm_idx = _board_index(pm_board)
+    section = ""
+    skip = {"positions", "surveys", "information desk", "divesting"}
+
+    sheet = doc.tables[1]
+    for row in sheet.rows:
+        pos_text = _norm(row.cells[3].text)
+        key = _norm_pos(pos_text)
+        if not key:
+            continue
+        if key in skip:
+            continue
+        # section headers are merged across the row
+        if pos_text == _norm(row.cells[0].text) and pos_text.upper() == pos_text or pos_text.isupper():
+            if pos_text not in {"POSITIONS"}:
+                section = pos_text
+            continue
+        if key in {
+            "main security checkpoint", "atrium", "south security checkpoint",
+            "north security checkpoint", "lower north security checkpoint",
+            "agt level", "surveys", "information desk", "divesting",
+        }:
+            section = pos_text
+            continue
+
+        am = _match_official_row(am_idx, section, pos_text)
+        pm = _match_official_row(pm_idx, section, pos_text)
+
+        def val(rowobj, field):
+            if rowobj is None:
+                return ""
+            v = _norm(rowobj.get(field, ""))
+            if v in {"UNFILLED", "NOT NEEDED", "NOT STAFFED", "NOT STAFFED PM"}:
+                return v
+            return v
+
+        row.cells[0].text = val(am, "Assigned Employee")
+        row.cells[1].text = val(am, "Shift")
+        row.cells[2].text = val(am, "Assigned Lunch")
+        row.cells[4].text = val(pm, "Assigned Employee")
+        row.cells[5].text = val(pm, "Shift")
+        row.cells[6].text = val(pm, "Assigned Lunch")
+
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()

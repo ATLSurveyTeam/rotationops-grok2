@@ -3,7 +3,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import date
 from io import BytesIO
-from scheduler import load_workbook_tables, build_full_day, build_official_sheet
+from scheduler import load_workbook_tables, build_full_day, build_official_sheet, fill_official_docx
 
 st.set_page_config(
     page_title="ATL Employee Scheduler 3.1",
@@ -103,8 +103,19 @@ if run_button:
         show_official.to_excel(writer, sheet_name="Official Assignment Sheet", index=False)
         am_board.to_excel(writer, sheet_name="AM Coverage Board", index=False)
         pm_board.to_excel(writer, sheet_name="PM Coverage Board", index=False)
+    template = Path(__file__).parent / "CXR_Daily_Assignment_Template.docx"
+    docx_bytes = fill_official_docx(
+        str(template), am_board, pm_board, selected_date, leads=leads
+    )
+
     st.download_button(
-        "Download Official Assignment Sheet",
+        "Download Word Assignment Sheet (for leads)",
+        data=docx_bytes,
+        file_name=f"CXR_Daily_Assignment_{selected_date.isoformat()}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    st.download_button(
+        "Download Excel copy",
         data=output.getvalue(),
         file_name=f"CXR_Daily_Assignment_{selected_date.isoformat()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
