@@ -67,10 +67,44 @@ def is_off_on_date(days_off, schedule_date) -> bool:
 
 
 def filter_available(emp: pd.DataFrame, schedule_date) -> pd.DataFrame:
-    if schedule_date is None or "Days Off" not in emp.columns:
-        return emp
-    mask = ~emp["Days Off"].apply(lambda d: is_off_on_date(d, schedule_date))
-    return emp[mask].copy()
+    out = emp.copy()
+    if "LOA" in out.columns:
+        out = out[~out["LOA"].map(_yes)].copy()
+    if schedule_date is None or "Days Off" not in out.columns:
+        return out
+    mask = ~out["Days Off"].apply(lambda d: is_off_on_date(d, schedule_date))
+    return out[mask].copy()
+
+
+def hold_survey_staff(staff: pd.DataFrame, surveys_needed: bool, for_survey_post: bool) -> pd.DataFrame:
+    """When surveys are Y, survey-qualified people may only fill survey seats."""
+    if not surveys_needed or "Survey" not in staff.columns:
+        return staff
+    if for_survey_post:
+        return staff[staff["Survey"].map(_yes)].copy()
+    return staff[~staff["Survey"].map(_yes)].copy()
+
+
+def duplicate_name_report(am_board: pd.DataFrame, pm_board: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for side, board in (("AM", am_board), ("PM", pm_board)):
+        if board is None or board.empty:
+            continue
+        names = board["Assigned Employee"].map(_norm)
+        skip = {"", "UNFILLED", "NOT NEEDED", "NOT STAFFED", "NOT STAFFED PM", "No Relief Needed"}
+        usable = board[(names != "") & (~names.isin(skip))].copy()
+        usable["_n"] = usable["Assigned Employee"].map(_norm)
+        counts = usable["_n"].value_counts()
+        dups = counts[counts > 1].index
+        for name in dups:
+            posts = usable[usable["_n"] == name]["Position Name"].tolist()
+            rows.append({
+                "Side": side,
+                "Employee": name,
+                "Times assigned": int(counts[name]),
+                "Positions": "; ".join(str(p) for p in posts),
+            })
+    return pd.DataFrame(rows)
 
 
 def pos_key(area, name) -> tuple:
@@ -186,8 +220,12 @@ def build_am_schedule(
     staff = emp[~emp["Lead"].map(_yes)].copy()
     staff = filter_available(staff, schedule_date)
 
-    am_345 = staff[staff["Shift"].map(_norm) == "3:45 AM"].copy()
-    am_545 = staff[staff["Shift"].map(_norm) == "5:45 AM"].copy()
+    regular = hold_survey_staff(staff, surveys_needed, for_survey_post=False)
+    survey_only = hold_survey_staff(staff, surveys_needed, for_survey_post=True)
+    am_345 = regular[regular["Shift"].map(_norm) == "3:45 AM"].copy()
+    am_545 = regular[regular["Shift"].map(_norm) == "5:45 AM"].copy()
+    am_345_survey = survey_only[survey_only["Shift"].map(_norm) == "3:45 AM"].copy()
+    am_545_survey = survey_only[survey_only["Shift"].map(_norm) == "5:45 AM"].copy()
 
     used = set()
     lunch_counts = defaultdict(int)
@@ -265,9 +303,7 @@ def build_am_schedule(
                 shift = "3:45 AM"
                 notes = "START 5:45 — fallback 3:45 still on duty"
         elif is_survey:
-            # Prefer survey-qualified 5:45 then 3:45
-            survey_pool = pd.concat([am_545, am_345], ignore_index=True)
-            survey_pool = survey_pool[survey_pool["Survey"].map(_yes)]
+            survey_pool = pd.concat([am_545_survey, am_345_survey], ignore_index=True)
             person = take_eligible(survey_pool, pname)
             if person is not None:
                 shift = _norm(person["Shift"])
@@ -451,8 +487,12 @@ def build_pm_schedule(
     staff = emp[~emp["Lead"].map(_yes)].copy()
     staff = filter_available(staff, schedule_date)
 
-    pm_1215 = staff[staff["Shift"].map(_norm) == "12:15 PM"].copy()
-    pm_200 = staff[staff["Shift"].map(_norm) == "2:00 PM"].copy()
+    regular = hold_survey_staff(staff, surveys_needed, for_survey_post=False)
+    survey_only = hold_survey_staff(staff, surveys_needed, for_survey_post=True)
+    pm_1215 = regular[regular["Shift"].map(_norm) == "12:15 PM"].copy()
+    pm_200 = regular[regular["Shift"].map(_norm) == "2:00 PM"].copy()
+    pm_1215_survey = survey_only[survey_only["Shift"].map(_norm) == "12:15 PM"].copy()
+    pm_200_survey = survey_only[survey_only["Shift"].map(_norm) == "2:00 PM"].copy()
 
     used = set()
     lunch_counts = defaultdict(int)
@@ -519,8 +559,7 @@ def build_pm_schedule(
         shift = wanted if wanted in {"12:15 PM", "2:00 PM"} else "12:15 PM"
 
         if is_survey:
-            survey_pool = pd.concat([pm_1215, pm_200], ignore_index=True)
-            survey_pool = survey_pool[survey_pool["Survey"].map(_yes)]
+            survey_pool = pd.concat([pm_1215_survey, pm_200_survey], ignore_index=True)
             person = take_eligible(survey_pool, pname)
             if person is not None:
                 shift = _norm(person["Shift"])
@@ -951,7 +990,8 @@ def _match_official_row(index, section, position):
 
 
 def fill_official_docx(template_path: str, am_board: pd.DataFrame, pm_board: pd.DataFrame,
-                       schedule_date, leads: str = "", pax: str = "") -> bytes:
+                       schedule_date, leads: str = "", pax: str = "",
+                       include_rovers: bool = False) -> bytes:
     from copy import copy
     from io import BytesIO
     from docx import Document
@@ -1014,6 +1054,42 @@ def fill_official_docx(template_path: str, am_board: pd.DataFrame, pm_board: pd.
         row.cells[4].text = val(pm, "Assigned Employee")
         row.cells[5].text = strip_ampm(val(pm, "Shift"))
         row.cells[6].text = strip_ampm(val(pm, "Assigned Lunch"))
+
+    if include_rovers:
+        from docx.oxml.ns import qn
+        sheet = doc.tables[1]
+        am_rovers = am_board[am_board["Area"].astype(str).str.contains("Rover", na=False)] if "Area" in am_board.columns else pd.DataFrame()
+        pm_rovers = pm_board[pm_board["Area"].astype(str).str.contains("Rover", na=False)] if "Area" in pm_board.columns else pd.DataFrame()
+        # add a header + rover rows by cloning the last data row formatting
+        last = sheet.rows[-1]
+        def add_row(values):
+            new_tr = last._tr
+            # simpler: use table add_row
+            cells = sheet.add_row().cells
+            for i, v in enumerate(values[:7]):
+                cells[i].text = "" if v is None else str(v)
+        add_row(["", "", "", "ROVER / RELIEF POOL", "", "", ""])
+        n = max(len(am_rovers), len(pm_rovers))
+        for i in range(n):
+            am = am_rovers.iloc[i] if i < len(am_rovers) else None
+            pm = pm_rovers.iloc[i] if i < len(pm_rovers) else None
+            add_row([
+                "" if am is None else _norm(am.get("Assigned Employee")),
+                "" if am is None else strip_ampm(_norm(am.get("Shift"))),
+                "" if am is None else strip_ampm(_norm(am.get("Assigned Lunch"))),
+                f"Rover (#{i+1})",
+                "" if pm is None else _norm(pm.get("Assigned Employee")),
+                "" if pm is None else strip_ampm(_norm(pm.get("Shift"))),
+                "" if pm is None else strip_ampm(_norm(pm.get("Assigned Lunch"))),
+            ])
+    else:
+        # scrub leftover rover wording from names if any
+        sheet = doc.tables[1]
+        for row in sheet.rows:
+            for cell in row.cells:
+                txt = cell.text
+                if "rover" in txt.lower():
+                    cell.text = txt.replace("Rover / Relief", "").replace("Rover/Relief", "")
 
     buf = BytesIO()
     doc.save(buf)

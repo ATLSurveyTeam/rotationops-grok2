@@ -18,6 +18,7 @@ CORE_FIELDS = [
     "Main Inside",
     "Survey",
     "Divest",
+    "LOA",
 ]
 
 SHIFTS = ["3:45 AM", "5:45 AM", "12:15 PM", "2:00 PM", "9:15 PM"]

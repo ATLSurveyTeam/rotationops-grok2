@@ -1,4 +1,4 @@
-openpyxl
+streamlit>=1.33.0
 pandas
+openpyxl
 python-docx
-streamlit

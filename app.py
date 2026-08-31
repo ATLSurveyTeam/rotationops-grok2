@@ -9,12 +9,20 @@ from scheduler import (
     build_official_sheet,
     fill_official_docx,
     apply_lead_sheet_overrides,
+    duplicate_name_report,
 )
 from fairness import (
     load_history,
     save_history,
     apply_reconciliation,
     burden_table,
+)
+from employee_admin import (
+    SHIFTS,
+    YN,
+    next_employee_id,
+    save_employee_master,
+    upsert_employee,
 )
 
 st.set_page_config(
@@ -29,6 +37,8 @@ st.caption("43-position client list  •  Lead sheet includes rovers  •  30-da
 
 WORKBOOK_PATH = Path(__file__).parent / "ATL_Employee_Scheduler_3.1.xlsx"
 
+page = st.sidebar.radio("Page", ["Daily Schedule", "Employee Admin"])
+st.sidebar.divider()
 st.sidebar.header("Schedule Controls")
 selected_date = st.sidebar.date_input("Select Schedule Date", value=date.today())
 leads = st.sidebar.text_input("Leads", value="")
@@ -38,7 +48,7 @@ run_button = st.sidebar.button("Run Schedule", type="primary")
 st.sidebar.divider()
 st.sidebar.caption("Type over names on the Official sheet, then click Apply Overrides.")
 st.sidebar.caption("Reconcile actual posts at end of day to keep the 30-day rotation fair.")
-st.sidebar.caption("Overnight comes later.")
+st.sidebar.caption("Use Employee Admin to hire or deactivate people.")
 
 
 @st.cache_data
@@ -49,9 +59,6 @@ def load_tables():
 
 
 data = load_tables()
-st.header("1. Selected Date")
-st.write(f"**{selected_date.strftime('%A, %B %d, %Y')}**")
-
 if data is None:
     st.error("3.1 workbook not found.")
     st.stop()
@@ -59,6 +66,100 @@ if data is None:
 positions = data["positions"]
 employees = data["employees"]
 relief = data["relief"]
+
+if page == "Employee Admin":
+    st.header("Employee Admin")
+    st.caption("Add a new hire or set Active to N when someone leaves. Do not delete rows.")
+    roster = pd.read_excel(WORKBOOK_PATH, sheet_name="Employee Master")
+    roster.columns = [str(c).strip() for c in roster.columns]
+    show_inactive = st.checkbox("Show inactive employees", value=False)
+    view = roster.copy()
+    if "Active" in view.columns and not show_inactive:
+        view = view[view["Active"].astype(str).str.upper().isin(["Y", "YES", "TRUE", "1"])]
+    display_cols = [c for c in [
+        "Employee ID", "Employee Name", "Shift", "Days Off", "Lead", "Mentor",
+        "Active", "LOA", "Divest", "Information Desk", "Main Inside", "Survey",
+    ] if c in view.columns]
+    st.dataframe(view[display_cols], use_container_width=True, hide_index=True)
+
+    st.subheader("Add or update one employee")
+    mode = st.radio("Action", ["Add new hire", "Update existing"], horizontal=True)
+    existing_ids = roster["Employee ID"].astype(str).tolist() if "Employee ID" in roster.columns else []
+    existing_names = roster["Employee Name"].astype(str).tolist() if "Employee Name" in roster.columns else []
+
+    if mode == "Update existing":
+        pick = st.selectbox("Select employee", sorted(existing_names))
+        current = roster[roster["Employee Name"].astype(str) == pick].iloc[0]
+        default_id = str(current.get("Employee ID", ""))
+        default_name = str(current.get("Employee Name", ""))
+        default_shift = str(current.get("Shift", "5:45 AM"))
+        default_off = str(current.get("Days Off", ""))
+        default_lead = "Y" if str(current.get("Lead", "N")).upper() in {"Y", "YES"} else "N"
+        default_mentor = "Y" if str(current.get("Mentor", "N")).upper() in {"Y", "YES"} else "N"
+        default_active = "Y" if str(current.get("Active", "Y")).upper() in {"Y", "YES"} else "N"
+        default_divest = "Y" if str(current.get("Divest", "N")).upper() in {"Y", "YES"} else "N"
+        default_info = "Y" if str(current.get("Information Desk", "N")).upper() in {"Y", "YES"} else "N"
+        default_inside = "Y" if str(current.get("Main Inside", "N")).upper() in {"Y", "YES"} else "N"
+        default_survey = "Y" if str(current.get("Survey", "N")).upper() in {"Y", "YES"} else "N"
+        default_loa = "Y" if str(current.get("LOA", "N")).upper() in {"Y", "YES"} else "N"
+    else:
+        default_id = next_employee_id(roster)
+        default_name = ""
+        default_shift = "5:45 AM"
+        default_off = ""
+        default_lead = "N"
+        default_mentor = "N"
+        default_active = "Y"
+        default_divest = "N"
+        default_info = "N"
+        default_inside = "N"
+        default_survey = "N"
+        default_loa = "N"
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        emp_id = st.text_input("Employee ID", value=default_id)
+        emp_name = st.text_input("Employee Name", value=default_name)
+        emp_shift = st.selectbox("Shift", SHIFTS, index=SHIFTS.index(default_shift) if default_shift in SHIFTS else 1)
+    with c2:
+        emp_off = st.text_input("Days Off (example: Sat, Sun)", value="" if default_off == "nan" else default_off)
+        emp_active = st.selectbox("Active", YN, index=0 if default_active == "Y" else 1)
+        emp_lead = st.selectbox("Lead", YN, index=0 if default_lead == "Y" else 1)
+    with c3:
+        emp_mentor = st.selectbox("Mentor", YN, index=0 if default_mentor == "Y" else 1)
+        emp_divest = st.selectbox("Divest qualified", YN, index=0 if default_divest == "Y" else 1)
+        emp_info = st.selectbox("Information Desk", YN, index=0 if default_info == "Y" else 1)
+        emp_inside = st.selectbox("Main Inside", YN, index=0 if default_inside == "Y" else 1)
+        emp_survey = st.selectbox("Survey", YN, index=0 if default_survey == "Y" else 1)
+        emp_loa = st.selectbox("LOA", YN, index=0 if default_loa == "Y" else 1)
+
+    if st.button("Save employee to workbook", type="primary"):
+        if not emp_name.strip():
+            st.warning("Name is required.")
+        else:
+            fields = {
+                "Employee ID": emp_id.strip(),
+                "Employee Name": emp_name.strip(),
+                "Shift": emp_shift,
+                "Days Off": emp_off.strip(),
+                "Lead": emp_lead,
+                "Mentor": emp_mentor,
+                "Active": emp_active,
+                "Information Desk": emp_info,
+                "Main Inside": emp_inside,
+                "Survey": emp_survey,
+                "Divest": emp_divest,
+                "LOA": emp_loa,
+            }
+            updated = upsert_employee(roster, fields)
+            save_employee_master(WORKBOOK_PATH, updated)
+            load_tables.clear()
+            st.success(f"Saved {emp_name.strip()} ({emp_id.strip()}). Active = {emp_active}.")
+            st.rerun()
+    st.stop()
+
+st.header("1. Selected Date")
+st.write(f"**{selected_date.strftime('%A, %B %d, %Y')}**")
 
 if run_button:
     history = load_history()
@@ -83,7 +184,25 @@ pm_board = st.session_state["pm_board"]
 official = st.session_state["official"]
 
 st.header("2. Lead sheet")
-st.caption("Type a new name, or clear a name for a call-out. Then click Apply Overrides.")
+st.caption("Click a name cell and start typing. Matching employee names will appear. Clear a name for a call-out, then click Apply Overrides.")
+
+name_options = [""]
+if "Employee Name" in employees.columns:
+    name_options += sorted({
+        str(n).strip()
+        for n in employees["Employee Name"].dropna().tolist()
+        if str(n).strip()
+    })
+for extra in ("UNFILLED", "NOT NEEDED", "NOT STAFFED"):
+    if extra not in name_options:
+        name_options.append(extra)
+# Keep any name already on the sheet so the editor does not blank it
+for col in ("Name (AM)", "Name (PM)"):
+    if col in official.columns:
+        for n in official[col].dropna().astype(str):
+            n = n.strip()
+            if n and n not in name_options:
+                name_options.append(n)
 
 edited = st.data_editor(
     official,
@@ -91,6 +210,18 @@ edited = st.data_editor(
     hide_index=True,
     num_rows="fixed",
     key="lead_sheet_editor",
+    column_config={
+        "Name (AM)": st.column_config.SelectboxColumn(
+            "Name (AM)",
+            options=name_options,
+            required=False,
+        ),
+        "Name (PM)": st.column_config.SelectboxColumn(
+            "Name (PM)",
+            options=name_options,
+            required=False,
+        ),
+    },
 )
 
 apply = st.button("Apply Overrides", type="primary")
@@ -134,13 +265,27 @@ with pd.ExcelWriter(output, engine="openpyxl") as writer:
     official.to_excel(writer, sheet_name="Official Assignment Sheet", index=False)
     am_board.to_excel(writer, sheet_name="AM Coverage Board", index=False)
     pm_board.to_excel(writer, sheet_name="PM Coverage Board", index=False)
+dups = duplicate_name_report(am_board, pm_board)
+if dups is not None and not dups.empty:
+    st.error("Duplicate names found on the assignment sheet. Fix these before printing.")
+    st.dataframe(dups, use_container_width=True, hide_index=True)
+else:
+    st.success("No duplicated names on the AM/PM assignment boards.")
+
 template = Path(__file__).parent / "CXR_Daily_Assignment_Template.docx"
-docx_bytes = fill_official_docx(str(template), am_board, pm_board, selected_date, leads=leads)
+lead_docx = fill_official_docx(str(template), am_board, pm_board, selected_date, leads=leads, include_rovers=True)
+recon_docx = fill_official_docx(str(template), am_board, pm_board, selected_date, leads=leads, include_rovers=False)
 
 st.download_button(
-    "Download Word Assignment Sheet (43 client positions only)",
-    data=docx_bytes,
-    file_name=f"CXR_Daily_Assignment_{selected_date.isoformat()}.docx",
+    "Download Lead Word sheet (includes rovers at bottom)",
+    data=lead_docx,
+    file_name=f"CXR_Lead_Sheet_{selected_date.isoformat()}.docx",
+    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+)
+st.download_button(
+    "Download Reconciled Word sheet (no rover / relief)",
+    data=recon_docx,
+    file_name=f"CXR_Reconciled_Sheet_{selected_date.isoformat()}.docx",
     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 )
 st.download_button(
