@@ -222,6 +222,11 @@ def build_am_schedule(
             "Notes": notes,
         }
 
+    staff_for_rovers = emp[~emp["Lead"].map(_yes)].copy()
+    am_rovers = assign_rovers(staff_for_rovers, used, ["3:45 AM", "5:45 AM"], lunch_counts, "AM")
+    for r in am_rovers:
+        assignment[r["Position Name"]] = r
+
     # Relief lookup by position name
     relief_map = {}
     for _, row in guide.iterrows():
@@ -262,13 +267,16 @@ def build_am_schedule(
         primary_lunch = rec.get("Assigned Lunch", "")
         found = False
         for cand_pos in candidates:
-            if cand_pos.lower() == "rover/relief":
-                rec["Break Relief Agent"] = "Rover / Relief"
-                rec["Relief From Position"] = "Rover / Relief"
-                rec["Relief Lunch"] = ""
-                rec["Status"] = "OK — Rover"
-                found = True
-                break
+            if "rover" in cand_pos.lower():
+                rover_list = [v for k, v in assignment.items() if str(k).startswith("Rover")]
+                rover = _pick_named_rover(rover_list, primary_lunch)
+                if rover is not None:
+                    rec["Break Relief Agent"] = rover.get("Assigned Employee", "")
+                    rec["Relief From Position"] = rover.get("Position Name", "Rover")
+                    rec["Relief Lunch"] = rover.get("Assigned Lunch", "")
+                    rec["Status"] = "OK — Rover"
+                    found = True
+                    break
             other = assignment.get(cand_pos)
             if not other:
                 continue
@@ -284,20 +292,21 @@ def build_am_schedule(
             found = True
             break
 
-        rec["Break Relief Agent"] = relief_name
-        rec["Relief From Position"] = relief_from
-        rec["Relief Lunch"] = relief_lunch
-        if found and relief_name:
-            rec["Status"] = "OK"
-        elif found and rec.get("Status") == "OK — Rover":
-            pass
-        else:
-            rec["Status"] = "NO RELIEF" if not relief_name else rec.get("Status")
-            if not found:
+        if not rec.get("Break Relief Agent"):
+            rec["Break Relief Agent"] = relief_name
+            rec["Relief From Position"] = relief_from
+            rec["Relief Lunch"] = relief_lunch
+        if rec.get("Status") not in {"OK", "OK — Rover"}:
+            if found and rec.get("Break Relief Agent"):
+                rec["Status"] = "OK"
+            elif not found:
                 rec["Status"] = "NO RELIEF / SAME LUNCH"
                 rec["Notes"] = (rec.get("Notes", "") + " | Relief chain blocked").strip(" |")
 
         rows.append(rec)
+
+    for r in am_rovers:
+        rows.append(r)
 
     cols = [
         "Pos #", "Area", "Position Name", "Tier", "Start Rule",
@@ -440,6 +449,11 @@ def build_pm_schedule(
             "Notes": f"Handoff from {am_name} ({am_shift})" if am_name else handoff,
         }
 
+    staff_for_rovers = emp[~emp["Lead"].map(_yes)].copy()
+    pm_rovers = assign_rovers(staff_for_rovers, used, ["12:15 PM", "2:00 PM"], lunch_counts, "PM")
+    for r in pm_rovers:
+        assignment[r["Position Name"]] = r
+
     relief_map = {}
     for _, row in relief_guide.iterrows():
         relief_map[_norm(row.get("Position Needing Relief"))] = [
@@ -474,12 +488,14 @@ def build_pm_schedule(
         found = False
         for cand_pos in candidates:
             if cand_pos.lower() == "rover/relief":
-                rec["Break Relief Agent"] = "Rover / Relief"
-                rec["Relief From Position"] = "Rover / Relief"
-                rec["Relief Lunch"] = ""
-                rec["Status"] = "OK — Rover"
-                found = True
-                break
+                rover = _pick_named_rover(pm_rovers, primary_lunch)
+                if rover is not None:
+                    rec["Break Relief Agent"] = rover["Assigned Employee"]
+                    rec["Relief From Position"] = rover["Position Name"]
+                    rec["Relief Lunch"] = rover.get("Assigned Lunch", "")
+                    rec["Status"] = "OK — Rover"
+                    found = True
+                    break
             other = assignment.get(cand_pos)
             if not other:
                 continue
@@ -502,6 +518,9 @@ def build_pm_schedule(
             rec["Status"] = "NO RELIEF / SAME LUNCH"
         rows.append(rec)
 
+    for r in pm_rovers:
+        rows.append(r)
+
     cols = [
         "Pos #", "Area", "Position Name", "Tier", "PM Handoff Rule",
         "Assigned Employee", "Shift", "Assigned Lunch",
@@ -519,3 +538,258 @@ def build_full_day(employees, positions, relief_guide, am_surveys=True, pm_surve
     am = build_am_schedule(employees, positions, relief_guide, surveys_needed=am_surveys)
     pm = build_pm_schedule(employees, positions, relief_guide, am, surveys_needed=pm_surveys)
     return am, pm
+
+
+def _remaining_pool(staff, used, shifts):
+    pool = staff[staff["Shift"].map(_norm).isin(shifts)].copy()
+    pool = pool[~pool["Employee ID"].isin(used)]
+    return pool
+
+
+def assign_rovers(staff, used, shifts, lunch_counts, prefix):
+    """Turn leftover staff into named Rover #1, #2, ..."""
+    pool = _remaining_pool(staff, used, shifts)
+    rovers = []
+    n = 1
+    for _, row in pool.iterrows():
+        used.add(row["Employee ID"])
+        shift = _norm(row["Shift"])
+        lunch = pick_lunch(shift, lunch_counts)
+        name = f"Rover (#{n})"
+        rec = {
+            "Pos #": 100 + n,
+            "Area": "Rover / Relief Pool",
+            "Position Name": name,
+            "Tier": "Rover",
+            "Assigned Employee": _norm(row["Employee Name"]),
+            "Employee ID": _norm(row["Employee ID"]),
+            "Shift": shift,
+            "Assigned Lunch": lunch,
+            "Status": "OK",
+            "Notes": "Named rover",
+            "Break Relief Agent": "No Relief Needed",
+            "Relief From Position": "",
+            "Relief Lunch": "",
+        }
+        rovers.append(rec)
+        n += 1
+        if n > 12:
+            break
+    return rovers
+
+
+def _pick_named_rover(rovers, primary_lunch):
+    for r in rovers:
+        if r.get("Assigned Lunch") and r.get("Assigned Lunch") == primary_lunch:
+            continue
+        if r.get("Assigned Employee"):
+            return r
+    return rovers[0] if rovers else None
+
+
+OFFICIAL_SECTIONS = [
+    ("MAIN SECURITY CHECKPOINT", [
+        "Front Entrance (#1)",
+        "Front Entrance (#2)",
+        "ADA Entrance (1)",
+        "Lanes 17-18 (1)",
+        "Inside Center (1)",
+        "Lanes 1-3/Pre-Check (1)",
+    ]),
+    ("ATRIUM", ["KIA (1)"]),
+    ("SOUTH SECURITY CHECKPOINT", [
+        "Checkpoint - Front Entrance (#1)",
+        "Checkpoint – Front Entrance (#1)",
+        "Checkpoint - Front Entrance (#2)",
+        "Checkpoint – Front Entrance (#2)",
+        "Checkpoint - Inside (#1)",
+        "Checkpoint – Inside (#1)",
+        "Checkpoint - Inside (#2)",
+        "Checkpoint – Inside (#2)",
+        "Hallway Pre-check Overflow (1)",
+        "South Restroom (1)",
+        "IHOP (1)",
+    ]),
+    ("NORTH SECURITY CHECKPOINT", [
+        "Checkpoint - Inside (1)",
+        "Checkpoint – Inside (1)",
+        "North Corridor (1)",
+        "North Restroom Hallway (#1)",
+        "North Restroom Hallway (#2)",
+        "We Juice It (1)",
+    ]),
+    ("LOWER NORTH SECURITY CHECKPOINT", [
+        "Checkpoint - Inside (1)",
+        "Checkpoint – Inside (1)",
+        "N5 Door (1)",
+        "LN2 Elevator (1)",
+    ]),
+    ("AGT LEVEL", [
+        "T Platform Train Doors (#1)",
+        "T Platform Train Doors (#2)",
+        "Domestic Baggage Claim (1)",
+        "T Bridge Landing (#1)",
+        "T Bridge Landing (#2)",
+        "Alpha West (1)",
+        "Bravo West (1)",
+        "Charlie West (1)",
+        "Delta West (1)",
+    ]),
+    ("SURVEYS", [
+        "Surveyor (#1)", "Surveyor (#2)", "Surveyor (#3)", "Surveyor (#4)",
+    ]),
+    ("INFORMATION DESK", ["Information Desk Personnel"]),
+    ("DIVESTING", [
+        "North Divesting (#1)",
+        "North Divesting (#2)",
+        "North Divesting (#3)",
+        "North Divesting (#4)",
+        "Lower North Divesting (#1)",
+        "Lower North Divesting (#2)",
+        "Lower North Divesting (#3)",
+    ]),
+]
+
+
+def _lookup_row(board, wanted_names):
+    by = {_norm(r["Position Name"]).replace("–", "-").replace("—", "-"): r for _, r in board.iterrows()}
+    for name in wanted_names:
+        key = _norm(name).replace("–", "-").replace("—", "-")
+        if key in by:
+            return by[key]
+    return None
+
+
+def build_official_sheet(am_board, pm_board, schedule_date, leads=""):
+    """Lead-familiar CXR Daily Assignment Sheet rows."""
+    rows = []
+    used_am = set()
+    used_pm = set()
+
+    # Unique positions in official order, avoiding hyphen-variant duplicates
+    seen = set()
+    official_unique = []
+    for section, names in [
+        ("MAIN SECURITY CHECKPOINT", [
+            "Front Entrance (#1)", "Front Entrance (#2)", "ADA Entrance (1)",
+            "Lanes 17-18 (1)", "Inside Center (1)", "Lanes 1-3/Pre-Check (1)",
+        ]),
+        ("ATRIUM", ["KIA (1)"]),
+        ("SOUTH SECURITY CHECKPOINT", [
+            "Checkpoint - Front Entrance (#1)", "Checkpoint - Front Entrance (#2)",
+            "Checkpoint - Inside (#1)", "Checkpoint - Inside (#2)",
+            "Hallway Pre-check Overflow (1)", "South Restroom (1)", "IHOP (1)",
+        ]),
+        ("NORTH SECURITY CHECKPOINT", [
+            "Checkpoint - Inside (1)", "North Corridor (1)",
+            "North Restroom Hallway (#1)", "North Restroom Hallway (#2)", "We Juice It (1)",
+        ]),
+        ("LOWER NORTH SECURITY CHECKPOINT", [
+            "Checkpoint - Inside (1)", "N5 Door (1)", "LN2 Elevator (1)",
+        ]),
+        ("AGT LEVEL", [
+            "T Platform Train Doors (#1)", "T Platform Train Doors (#2)",
+            "Domestic Baggage Claim (1)", "T Bridge Landing (#1)", "T Bridge Landing (#2)",
+            "Alpha West (1)", "Bravo West (1)", "Charlie West (1)", "Delta West (1)",
+        ]),
+        ("SURVEYS", ["Surveyor (#1)", "Surveyor (#2)", "Surveyor (#3)", "Surveyor (#4)"]),
+        ("INFORMATION DESK", ["Information Desk Personnel"]),
+        ("DIVESTING", [
+            "North Divesting (#1)", "North Divesting (#2)", "North Divesting (#3)", "North Divesting (#4)",
+            "Lower North Divesting (#1)", "Lower North Divesting (#2)", "Lower North Divesting (#3)",
+        ]),
+    ]:
+        official_unique.append((section, names))
+
+    def find_row(board, pname, used):
+        target = _norm(pname).replace("–", "-").replace("—", "-").lower()
+        for _, r in board.iterrows():
+            key = _norm(r["Position Name"]).replace("–", "-").replace("—", "-").lower()
+            if key == target:
+                ident = (key, _norm(r.get("Area")))
+                # Lower North vs North both have Checkpoint - Inside (1)
+                return r
+        return None
+
+    # More precise: match by Area + position
+    def find_row_area(board, section, pname):
+        target = _norm(pname).replace("–", "-").replace("—", "-").lower()
+        section_key = section.lower()
+        for _, r in board.iterrows():
+            key = _norm(r["Position Name"]).replace("–", "-").replace("—", "-").lower()
+            area = _norm(r.get("Area")).lower()
+            if key != target:
+                continue
+            if "lower north" in section_key and "lower north" in area:
+                return r
+            if "north security" in section_key and "north security" in area and "lower" not in area:
+                return r
+            if "south" in section_key and "south" in area:
+                return r
+            if "main" in section_key and "main" in area:
+                return r
+            if "atrium" in section_key and "atrium" in area:
+                return r
+            if "agt" in section_key and "agt" in area:
+                return r
+            if "survey" in section_key and "survey" in area:
+                return r
+            if "information" in section_key and "information" in area:
+                return r
+            if "divest" in section_key and "divest" in key:
+                return r
+        # fallback by name only
+        for _, r in board.iterrows():
+            key = _norm(r["Position Name"]).replace("–", "-").replace("—", "-").lower()
+            if key == target:
+                return r
+        return None
+
+    out = []
+    for section, names in official_unique:
+        out.append({
+            "Name (AM)": "", "Shift (AM)": "", "Lunch (AM)": "",
+            "POSITIONS": section,
+            "Name (PM)": "", "Shift (PM)": "", "Lunch (PM)": "",
+            "_header": True,
+        })
+        for pname in names:
+            am = find_row_area(am_board, section, pname)
+            pm = find_row_area(pm_board, section, pname)
+            out.append({
+                "Name (AM)": "" if am is None else _norm(am.get("Assigned Employee")),
+                "Shift (AM)": "" if am is None else _norm(am.get("Shift")),
+                "Lunch (AM)": "" if am is None else _norm(am.get("Assigned Lunch")),
+                "POSITIONS": pname.replace(" - ", " – "),
+                "Name (PM)": "" if pm is None else _norm(pm.get("Assigned Employee")),
+                "Shift (PM)": "" if pm is None else _norm(pm.get("Shift")),
+                "Lunch (PM)": "" if pm is None else _norm(pm.get("Assigned Lunch")),
+                "_header": False,
+            })
+
+    # Rover section
+    out.append({
+        "Name (AM)": "", "Shift (AM)": "", "Lunch (AM)": "",
+        "POSITIONS": "ROVER / RELIEF POOL",
+        "Name (PM)": "", "Shift (PM)": "", "Lunch (PM)": "",
+        "_header": True,
+    })
+    am_rovers = am_board[am_board["Area"] == "Rover / Relief Pool"] if "Area" in am_board.columns else pd.DataFrame()
+    pm_rovers = pm_board[pm_board["Area"] == "Rover / Relief Pool"] if "Area" in pm_board.columns else pd.DataFrame()
+    max_r = max(len(am_rovers), len(pm_rovers))
+    for i in range(max_r):
+        am = am_rovers.iloc[i] if i < len(am_rovers) else None
+        pm = pm_rovers.iloc[i] if i < len(pm_rovers) else None
+        out.append({
+            "Name (AM)": "" if am is None else _norm(am.get("Assigned Employee")),
+            "Shift (AM)": "" if am is None else _norm(am.get("Shift")),
+            "Lunch (AM)": "" if am is None else _norm(am.get("Assigned Lunch")),
+            "POSITIONS": f"Rover (#{i+1})",
+            "Name (PM)": "" if pm is None else _norm(pm.get("Assigned Employee")),
+            "Shift (PM)": "" if pm is None else _norm(pm.get("Shift")),
+            "Lunch (PM)": "" if pm is None else _norm(pm.get("Assigned Lunch")),
+            "_header": False,
+        })
+
+    df = pd.DataFrame(out)
+    return df

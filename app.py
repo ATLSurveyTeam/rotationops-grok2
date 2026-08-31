@@ -3,7 +3,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import date
 from io import BytesIO
-from scheduler import load_workbook_tables, build_full_day
+from scheduler import load_workbook_tables, build_full_day, build_official_sheet
 
 st.set_page_config(
     page_title="ATL Employee Scheduler 3.1",
@@ -13,12 +13,13 @@ st.set_page_config(
 )
 
 st.title("ATL Employee Scheduler 3.1")
-st.caption("43-position plan  •  AM + PM  •  3:45 AM – 11:00 PM")
+st.caption("43-position plan  •  AM + PM  •  Official Lead assignment sheet")
 
 WORKBOOK_PATH = Path(__file__).parent / "ATL_Employee_Scheduler_3.1.xlsx"
 
 st.sidebar.header("Schedule Controls")
 selected_date = st.sidebar.date_input("Select Schedule Date", value=date.today())
+leads = st.sidebar.text_input("Leads", value="")
 am_surveys = st.sidebar.selectbox("AM Surveys Needed?", ["Y", "N"]) == "Y"
 pm_surveys = st.sidebar.selectbox("PM Surveys Needed?", ["Y", "N"]) == "Y"
 run_button = st.sidebar.button("Run Schedule", type="primary")
@@ -65,6 +66,8 @@ if run_button:
         am_surveys=am_surveys,
         pm_surveys=pm_surveys,
     )
+    official = build_official_sheet(am_board, pm_board, selected_date.isoformat(), leads=leads)
+    show_official = official.drop(columns=["_header"], errors="ignore")
 
     ok_status = {"OK", "OK — Rover", "SURVEYS OFF", "NOT STAFFED PM"}
     am_flags = am_board[~am_board["Status"].astype(str).isin(ok_status)]
@@ -76,7 +79,14 @@ if run_button:
     m3.metric("AM needs review", int(len(am_flags)))
     m4.metric("PM needs review", int(len(pm_flags)))
 
-    tab_am, tab_pm = st.tabs(["AM Coverage Board", "PM Coverage Board"])
+    tab_off, tab_am, tab_pm = st.tabs([
+        "Official Assignment Sheet",
+        "AM Coverage Board",
+        "PM Coverage Board",
+    ])
+    with tab_off:
+        st.caption("This matches the CXR Daily Assignment Sheet the leads already use.")
+        st.dataframe(show_official, use_container_width=True, hide_index=True)
     with tab_am:
         st.dataframe(am_board, use_container_width=True, hide_index=True)
         if len(am_flags) > 0:
@@ -90,14 +100,15 @@ if run_button:
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        show_official.to_excel(writer, sheet_name="Official Assignment Sheet", index=False)
         am_board.to_excel(writer, sheet_name="AM Coverage Board", index=False)
         pm_board.to_excel(writer, sheet_name="PM Coverage Board", index=False)
     st.download_button(
-        "Download AM + PM Coverage Boards",
+        "Download Official Assignment Sheet",
         data=output.getvalue(),
-        file_name=f"Coverage_{selected_date.isoformat()}.xlsx",
+        file_name=f"CXR_Daily_Assignment_{selected_date.isoformat()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
     st.write("Set the date, AM surveys, and PM surveys. Then click **Run Schedule**.")
-    st.write("You will get two boards: AM (3:45 / 5:45) and PM (12:15 / 2:00 handoffs).")
+    st.write("The first tab will look like the official Lead assignment sheet.")
