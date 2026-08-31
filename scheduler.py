@@ -15,6 +15,8 @@ Rules encoded from ATL_Employee_Scheduler_3.1:
 from collections import defaultdict
 import pandas as pd
 
+from fairness import sort_pool_by_fairness, load_history, is_fair_tracked
+
 
 LUNCH_BY_SHIFT = {
     "3:45 AM": ["8:00 AM", "9:00 AM"],
@@ -99,6 +101,28 @@ def pick_lunch(shift: str, counts: dict) -> str:
     return best
 
 
+def other_lunches(shift: str, current: str) -> list:
+    options = LUNCH_BY_SHIFT.get(_norm(shift), [])
+    return [t for t in options if t and t != current]
+
+
+def try_move_lunch(record: dict, avoid: str, counts: dict) -> bool:
+    """Move a person's lunch to another allowed window so it does not match avoid."""
+    if not record:
+        return False
+    current = record.get("Assigned Lunch", "")
+    if current and current != avoid:
+        return True
+    for option in other_lunches(record.get("Shift", ""), current):
+        if option != avoid:
+            if current:
+                counts[current] = max(0, counts.get(current, 1) - 1)
+            record["Assigned Lunch"] = option
+            counts[option] = counts.get(option, 0) + 1
+            return True
+    return False
+
+
 def load_workbook_tables(path: str) -> dict:
     positions = pd.read_excel(path, sheet_name="Position Library")
     positions.columns = [str(c).strip() for c in positions.columns]
@@ -148,6 +172,7 @@ def build_am_schedule(
     relief_guide: pd.DataFrame,
     surveys_needed: bool = True,
     schedule_date=None,
+    history: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     emp = employees.copy()
     pos = positions.copy()
@@ -167,9 +192,12 @@ def build_am_schedule(
     used = set()
     lunch_counts = defaultdict(int)
     assignment = {}  # position name -> dict
+    if history is None:
+        history = load_history()
 
     def take_eligible(pool: pd.DataFrame, position_name: str):
-        for idx, row in pool.iterrows():
+        ordered = sort_pool_by_fairness(pool, position_name, history, schedule_date)
+        for idx, row in ordered.iterrows():
             eid = row["Employee ID"]
             if eid in used:
                 continue
@@ -346,7 +374,12 @@ def build_am_schedule(
                 continue
             other_lunch = other.get("Assigned Lunch", "")
             if other_lunch and other_lunch == primary_lunch:
-                continue
+                if try_move_lunch(other, primary_lunch, lunch_counts):
+                    other_lunch = other.get("Assigned Lunch", "")
+                elif try_move_lunch(rec, other_lunch, lunch_counts):
+                    primary_lunch = rec.get("Assigned Lunch", "")
+                else:
+                    continue
             relief_name = other_name
             relief_from = cand_pos
             relief_lunch = other_lunch
@@ -411,6 +444,7 @@ def build_pm_schedule(
     am_board: pd.DataFrame,
     surveys_needed: bool = True,
     schedule_date=None,
+    history: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     emp = employees.copy()
     pos = positions.copy()
@@ -422,6 +456,9 @@ def build_pm_schedule(
 
     used = set()
     lunch_counts = defaultdict(int)
+    if history is None:
+        history = load_history()
+
     def am_lookup(area, pname):
         target = _norm_pos(pname)
         area_l = _norm(area).lower()
@@ -433,7 +470,8 @@ def build_pm_schedule(
         return {}
 
     def take_eligible(pool: pd.DataFrame, position_name: str):
-        for idx, row in pool.iterrows():
+        ordered = sort_pool_by_fairness(pool, position_name, history, schedule_date)
+        for idx, row in ordered.iterrows():
             eid = row["Employee ID"]
             if eid in used:
                 continue
@@ -574,7 +612,12 @@ def build_pm_schedule(
                 continue
             other_lunch = other.get("Assigned Lunch", "")
             if other_lunch and other_lunch == primary_lunch:
-                continue
+                if try_move_lunch(other, primary_lunch, lunch_counts):
+                    other_lunch = other.get("Assigned Lunch", "")
+                elif try_move_lunch(rec, other_lunch, lunch_counts):
+                    primary_lunch = rec.get("Assigned Lunch", "")
+                else:
+                    continue
             rec["Break Relief Agent"] = other_name
             rec["Relief From Position"] = cand_pos
             rec["Relief Lunch"] = other_lunch
@@ -604,9 +647,11 @@ def build_pm_schedule(
     return out[cols]
 
 
-def build_full_day(employees, positions, relief_guide, am_surveys=True, pm_surveys=True, schedule_date=None):
-    am = build_am_schedule(employees, positions, relief_guide, surveys_needed=am_surveys, schedule_date=schedule_date)
-    pm = build_pm_schedule(employees, positions, relief_guide, am, surveys_needed=pm_surveys, schedule_date=schedule_date)
+def build_full_day(employees, positions, relief_guide, am_surveys=True, pm_surveys=True, schedule_date=None, history=None):
+    if history is None:
+        history = load_history()
+    am = build_am_schedule(employees, positions, relief_guide, surveys_needed=am_surveys, schedule_date=schedule_date, history=history)
+    pm = build_pm_schedule(employees, positions, relief_guide, am, surveys_needed=pm_surveys, schedule_date=schedule_date, history=history)
     return am, pm
 
 
@@ -973,3 +1018,104 @@ def fill_official_docx(template_path: str, am_board: pd.DataFrame, pm_board: pd.
     buf = BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+def apply_lead_sheet_overrides(official_edit: pd.DataFrame, am_board: pd.DataFrame,
+                               pm_board: pd.DataFrame, employees: pd.DataFrame) -> tuple:
+    """Lock typed names from the official lead sheet, fill blanks from rovers, keep rest stable."""
+    am = am_board.copy()
+    pm = pm_board.copy()
+    emp_by_name = {}
+    for _, row in employees.iterrows():
+        emp_by_name[_norm(row.get("Employee Name")).lower()] = row
+
+    def lookup_emp(name):
+        return emp_by_name.get(_norm(name).lower())
+
+    def set_name(board, section, pname, new_name, side):
+        new_name = _norm(new_name)
+        if new_name.upper() in {"", "UNFILLED", "NOT NEEDED", "NOT STAFFED", "NOT STAFFED PM"}:
+            target_blank = True
+        else:
+            target_blank = False
+        target = _norm_pos(pname)
+        section_l = _norm(section).lower()
+        idx_hit = None
+        for i, row in board.iterrows():
+            if _norm_pos(row.get("Position Name", "")) != target:
+                continue
+            area = _norm(row.get("Area")).lower()
+            if "lower north" in section_l and "lower north" not in area:
+                continue
+            if section_l.startswith("north") and "lower" not in section_l and "lower" in area:
+                continue
+            if "south" in section_l and "south" not in area:
+                continue
+            if "main" in section_l and "main" not in area and "front" in target:
+                continue
+            idx_hit = i
+            break
+        if idx_hit is None:
+            for i, row in board.iterrows():
+                if _norm_pos(row.get("Position Name", "")) == target:
+                    idx_hit = i
+                    break
+        if idx_hit is None:
+            return board
+        if target_blank:
+            board.at[idx_hit, "Assigned Employee"] = "UNFILLED"
+            board.at[idx_hit, "Shift"] = ""
+            board.at[idx_hit, "Assigned Lunch"] = ""
+            board.at[idx_hit, "Status"] = "UNFILLED"
+            board.at[idx_hit, "Notes"] = "Cleared by override"
+            return board
+        info = lookup_emp(new_name)
+        board.at[idx_hit, "Assigned Employee"] = new_name
+        if info is not None:
+            board.at[idx_hit, "Shift"] = _norm(info.get("Shift"))
+            if "Assigned Lunch" in board.columns and not _norm(board.at[idx_hit, "Assigned Lunch"]):
+                board.at[idx_hit, "Assigned Lunch"] = pick_lunch(_norm(info.get("Shift")), defaultdict(int))
+        board.at[idx_hit, "Status"] = "LOCKED OVERRIDE"
+        board.at[idx_hit, "Notes"] = "Locked from lead sheet"
+        return board
+
+    current_section = ""
+    for _, row in official_edit.iterrows():
+        pos = _norm(row.get("POSITIONS"))
+        if not pos:
+            continue
+        if pos.isupper() or pos in {"ROVER / RELIEF POOL"}:
+            current_section = pos
+            continue
+        am_name = _norm(row.get("Name (AM)"))
+        pm_name = _norm(row.get("Name (PM)"))
+        am = set_name(am, current_section, pos, am_name, "AM")
+        pm = set_name(pm, current_section, pos, pm_name, "PM")
+
+    def fill_from_rovers(board):
+        rover_idx = [
+            i for i, r in board.iterrows()
+            if _norm(r.get("Area")) == "Rover / Relief Pool" and _norm(r.get("Assigned Employee")) not in {"", "UNFILLED"}
+        ]
+        open_idx = [
+            i for i, r in board.iterrows()
+            if _norm(r.get("Assigned Employee")) in {"", "UNFILLED"}
+            and _norm(r.get("Area")) != "Rover / Relief Pool"
+            and "survey" not in _norm(r.get("Position Name")).lower()
+        ]
+        for oi in open_idx:
+            if not rover_idx:
+                break
+            ri = rover_idx.pop(0)
+            board.at[oi, "Assigned Employee"] = board.at[ri, "Assigned Employee"]
+            board.at[oi, "Shift"] = board.at[ri, "Shift"]
+            board.at[oi, "Assigned Lunch"] = board.at[ri, "Assigned Lunch"]
+            board.at[oi, "Status"] = "FILLED FROM ROVER"
+            board.at[oi, "Notes"] = f"From {board.at[ri, 'Position Name']}"
+            board.at[ri, "Assigned Employee"] = "UNFILLED"
+            board.at[ri, "Status"] = "ROVER USED"
+        return board
+
+    am = fill_from_rovers(am)
+    pm = fill_from_rovers(pm)
+    return am, pm
