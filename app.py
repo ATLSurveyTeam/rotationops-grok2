@@ -81,6 +81,15 @@ if page == "Employee Admin":
         "Active", "LOA", "Divest", "Information Desk", "Main Inside", "Survey",
     ] if c in view.columns]
     st.dataframe(view[display_cols], use_container_width=True, hide_index=True)
+    roster_bytes = BytesIO()
+    roster.to_excel(roster_bytes, index=False)
+    st.download_button(
+        "Download current Employee Master",
+        data=roster_bytes.getvalue(),
+        file_name="Employee_Master.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.caption("After you save a hire, termination, or LOA, download this file and upload it to GitHub so Render keeps the change.")
 
     st.subheader("Add or update one employee")
     mode = st.radio("Action", ["Add new hire", "Update existing"], horizontal=True)

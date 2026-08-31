@@ -155,15 +155,29 @@ def score_for(employee_name: str, position_name: str, history: pd.DataFrame, sch
     return (family_days, family_consec, total_days, name.lower())
 
 
+def rotation_tiebreak(name, position_name, schedule_date) -> str:
+    """Change who is first in line from day to day, even with no history."""
+    import hashlib
+    date_text = schedule_date.isoformat() if hasattr(schedule_date, "isoformat") else str(schedule_date or "")
+    raw = f"{date_text}|{position_name}|{name}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
 def sort_pool_by_fairness(pool: pd.DataFrame, position_name: str, history: pd.DataFrame, schedule_date) -> pd.DataFrame:
-    if pool is None or pool.empty or not is_fair_tracked(position_name):
+    if pool is None or pool.empty:
         return pool
     scored = pool.copy()
-    scored["_fair"] = scored["Employee Name"].map(
-        lambda n: score_for(n, position_name, history, schedule_date)
+    if is_fair_tracked(position_name):
+        scored["_fair"] = scored["Employee Name"].map(
+            lambda n: score_for(n, position_name, history, schedule_date)
+        )
+    else:
+        scored["_fair"] = [(0, 0, 0, "")] * len(scored)
+    scored["_spin"] = scored["Employee Name"].map(
+        lambda n: rotation_tiebreak(n, position_name, schedule_date)
     )
-    scored = scored.sort_values("_fair")
-    return scored.drop(columns=["_fair"])
+    scored = scored.sort_values(["_fair", "_spin"])
+    return scored.drop(columns=["_fair", "_spin"])
 
 
 def rows_from_board(board: pd.DataFrame, schedule_date, side: str, source: str, reconciled_by: str) -> list:

@@ -361,6 +361,7 @@ def build_am_schedule(
         ]
 
     rows = []
+    used_relief = set()
     for _, p in pos.sort_values("Display Order").iterrows():
         pname = _norm(p["Position"])
         area = _norm(p.get("Area"))
@@ -394,9 +395,11 @@ def build_am_schedule(
         for cand_pos in candidates:
             if "rover" in cand_pos.lower():
                 rover_list = [v for v in assignment.values() if str(v.get("Position Name","")).startswith("Rover")]
-                rover = _pick_named_rover(rover_list, primary_lunch)
+                rover = _pick_named_rover(rover_list, primary_lunch, used_relief)
                 if rover is not None:
-                    rec["Break Relief Agent"] = rover.get("Assigned Employee", "")
+                    rname = rover.get("Assigned Employee", "")
+                    used_relief.add((_norm(rname).lower(), _norm(primary_lunch)))
+                    rec["Break Relief Agent"] = rname
                     rec["Relief From Position"] = rover.get("Position Name", "Rover")
                     rec["Relief Lunch"] = rover.get("Assigned Lunch", "")
                     rec["Status"] = "OK — Rover"
@@ -609,6 +612,7 @@ def build_pm_schedule(
         ]
 
     rows = []
+    used_relief = set()
     for _, p in pos.iterrows():
         pname = _norm(p["Position"])
         area = _norm(p.get("Area"))
@@ -635,9 +639,11 @@ def build_pm_schedule(
         found = False
         for cand_pos in candidates:
             if cand_pos.lower() == "rover/relief":
-                rover = _pick_named_rover(pm_rovers, primary_lunch)
+                rover = _pick_named_rover(pm_rovers, primary_lunch, used_relief)
                 if rover is not None:
-                    rec["Break Relief Agent"] = rover["Assigned Employee"]
+                    rname = rover["Assigned Employee"]
+                    used_relief.add((_norm(rname).lower(), _norm(primary_lunch)))
+                    rec["Break Relief Agent"] = rname
                     rec["Relief From Position"] = rover["Position Name"]
                     rec["Relief Lunch"] = rover.get("Assigned Lunch", "")
                     rec["Status"] = "OK — Rover"
@@ -732,13 +738,22 @@ def assign_rovers(staff, used, shifts, lunch_counts, prefix):
     return rovers
 
 
-def _pick_named_rover(rovers, primary_lunch):
+def _pick_named_rover(rovers, primary_lunch, used_relief=None):
+    used_relief = used_relief or set()
+    fallback = None
     for r in rovers:
-        if r.get("Assigned Lunch") and r.get("Assigned Lunch") == primary_lunch:
+        name = _norm(r.get("Assigned Employee"))
+        if not name:
             continue
-        if r.get("Assigned Employee"):
-            return r
-    return rovers[0] if rovers else None
+        key = (name.lower(), _norm(primary_lunch))
+        if key in used_relief:
+            continue
+        if r.get("Assigned Lunch") and r.get("Assigned Lunch") == primary_lunch:
+            if fallback is None:
+                fallback = r
+            continue
+        return r
+    return fallback
 
 
 OFFICIAL_SECTIONS = [
