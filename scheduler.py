@@ -317,3 +317,205 @@ def build_schedule(employees: pd.DataFrame, positions: pd.DataFrame, relief_guid
     if relief_guide is None:
         relief_guide = pd.DataFrame(columns=["Position Needing Relief", "Primary Relief", "Secondary Relief", "Tertiary Relief"])
     return build_am_schedule(employees, positions, relief_guide, surveys_needed=surveys_needed)
+
+def _handoff_shift(pm_handoff: str, am_shift: str) -> str:
+    text = _norm(pm_handoff).lower()
+    if "not staffed" in text:
+        return "NOT STAFFED"
+    if "survey" in text:
+        return "SURVEY"
+    if "12:15" in text:
+        return "12:15 PM"
+    if "2:00" in text:
+        return "2:00 PM"
+    # Covered by either — follow AM person still on post
+    if "3:45" in _norm(am_shift):
+        return "12:15 PM"
+    return "2:00 PM"
+
+
+def build_pm_schedule(
+    employees: pd.DataFrame,
+    positions: pd.DataFrame,
+    relief_guide: pd.DataFrame,
+    am_board: pd.DataFrame,
+    surveys_needed: bool = True,
+) -> pd.DataFrame:
+    emp = employees.copy()
+    pos = positions.copy()
+    staff = emp[~emp["Lead"].map(_yes)].copy()
+
+    pm_1215 = staff[staff["Shift"].map(_norm) == "12:15 PM"].copy()
+    pm_200 = staff[staff["Shift"].map(_norm) == "2:00 PM"].copy()
+
+    used = set()
+    lunch_counts = defaultdict(int)
+    am_by_name = {
+        _norm(r["Position Name"]): r for _, r in am_board.iterrows()
+    }
+
+    def take_eligible(pool: pd.DataFrame, position_name: str):
+        for idx, row in pool.iterrows():
+            eid = row["Employee ID"]
+            if eid in used:
+                continue
+            if not _eligible_for_position(row, position_name):
+                continue
+            used.add(eid)
+            return row
+        return None
+
+    assignment = {}
+    pos = pos.sort_values("Display Order")
+
+    for _, p in pos.iterrows():
+        pname = _norm(p["Position"])
+        area = _norm(p.get("Area"))
+        tier = _norm(p.get("Legacy Tier"))
+        display = p.get("Display Order")
+        handoff = _norm(p.get("PM Handoff"))
+        am_row = am_by_name.get(pname, {})
+        am_shift = _norm(am_row.get("Shift", ""))
+        am_name = _norm(am_row.get("Assigned Employee", ""))
+
+        is_survey = "survey" in area.lower() or "surveyor" in pname.lower()
+        wanted = _handoff_shift(handoff, am_shift)
+
+        if wanted == "NOT STAFFED":
+            assignment[pname] = {
+                "Pos #": display, "Area": area, "Position Name": pname, "Tier": tier,
+                "PM Handoff Rule": handoff, "Assigned Employee": "NOT STAFFED",
+                "Shift": "", "Assigned Lunch": "", "Status": "NOT STAFFED PM",
+                "Notes": f"AM was {am_name}" if am_name else "Not staffed in PM",
+            }
+            continue
+
+        if is_survey and not surveys_needed:
+            assignment[pname] = {
+                "Pos #": display, "Area": area, "Position Name": pname, "Tier": tier or "Survey",
+                "PM Handoff Rule": handoff, "Assigned Employee": "NOT NEEDED",
+                "Shift": "", "Assigned Lunch": "", "Status": "SURVEYS OFF",
+                "Notes": "PM survey flag is N",
+            }
+            continue
+
+        person = None
+        shift = wanted if wanted in {"12:15 PM", "2:00 PM"} else "12:15 PM"
+
+        if is_survey:
+            survey_pool = pd.concat([pm_1215, pm_200], ignore_index=True)
+            survey_pool = survey_pool[survey_pool["Survey"].map(_yes)]
+            person = take_eligible(survey_pool, pname)
+            if person is not None:
+                shift = _norm(person["Shift"])
+        elif shift == "12:15 PM":
+            person = take_eligible(pm_1215, pname)
+            if person is None:
+                person = take_eligible(pm_200, pname)
+                if person is not None:
+                    shift = "2:00 PM"
+        else:
+            person = take_eligible(pm_200, pname)
+            if person is None:
+                person = take_eligible(pm_1215, pname)
+                if person is not None:
+                    shift = "12:15 PM"
+
+        if person is None:
+            assignment[pname] = {
+                "Pos #": display, "Area": area, "Position Name": pname, "Tier": tier,
+                "PM Handoff Rule": handoff, "Assigned Employee": "UNFILLED",
+                "Shift": "", "Assigned Lunch": "", "Status": "UNFILLED",
+                "Notes": f"Handoff from AM {am_name} ({am_shift})" if am_name else handoff,
+            }
+            continue
+
+        lunch = pick_lunch(shift, lunch_counts)
+        assignment[pname] = {
+            "Pos #": display, "Area": area, "Position Name": pname, "Tier": tier,
+            "PM Handoff Rule": handoff,
+            "Assigned Employee": _norm(person["Employee Name"]),
+            "Employee ID": _norm(person["Employee ID"]),
+            "Shift": shift, "Assigned Lunch": lunch, "Status": "ASSIGNED",
+            "Notes": f"Handoff from {am_name} ({am_shift})" if am_name else handoff,
+        }
+
+    relief_map = {}
+    for _, row in relief_guide.iterrows():
+        relief_map[_norm(row.get("Position Needing Relief"))] = [
+            _norm(row.get("Primary Relief")),
+            _norm(row.get("Secondary Relief")),
+            _norm(row.get("Tertiary Relief")),
+        ]
+
+    rows = []
+    for _, p in pos.iterrows():
+        pname = _norm(p["Position"])
+        rec = dict(assignment.get(pname, {}))
+        if not rec:
+            continue
+        if rec.get("Assigned Employee") in {"UNFILLED", "NOT NEEDED", "NOT STAFFED"}:
+            rec["Break Relief Agent"] = ""
+            rec["Relief From Position"] = ""
+            rec["Relief Lunch"] = ""
+            rows.append(rec)
+            continue
+
+        candidates = [c for c in relief_map.get(pname, []) if c]
+        if not candidates or candidates[0].lower().startswith("no relief"):
+            rec["Break Relief Agent"] = "No Relief Needed"
+            rec["Relief From Position"] = ""
+            rec["Relief Lunch"] = ""
+            rec["Status"] = "OK"
+            rows.append(rec)
+            continue
+
+        primary_lunch = rec.get("Assigned Lunch", "")
+        found = False
+        for cand_pos in candidates:
+            if cand_pos.lower() == "rover/relief":
+                rec["Break Relief Agent"] = "Rover / Relief"
+                rec["Relief From Position"] = "Rover / Relief"
+                rec["Relief Lunch"] = ""
+                rec["Status"] = "OK — Rover"
+                found = True
+                break
+            other = assignment.get(cand_pos)
+            if not other:
+                continue
+            other_name = other.get("Assigned Employee", "")
+            if other_name in {"", "UNFILLED", "NOT NEEDED", "NOT STAFFED"}:
+                continue
+            other_lunch = other.get("Assigned Lunch", "")
+            if other_lunch and other_lunch == primary_lunch:
+                continue
+            rec["Break Relief Agent"] = other_name
+            rec["Relief From Position"] = cand_pos
+            rec["Relief Lunch"] = other_lunch
+            rec["Status"] = "OK"
+            found = True
+            break
+        if not found:
+            rec["Break Relief Agent"] = ""
+            rec["Relief From Position"] = ""
+            rec["Relief Lunch"] = ""
+            rec["Status"] = "NO RELIEF / SAME LUNCH"
+        rows.append(rec)
+
+    cols = [
+        "Pos #", "Area", "Position Name", "Tier", "PM Handoff Rule",
+        "Assigned Employee", "Shift", "Assigned Lunch",
+        "Break Relief Agent", "Relief From Position", "Relief Lunch",
+        "Status", "Notes",
+    ]
+    out = pd.DataFrame(rows)
+    for c in cols:
+        if c not in out.columns:
+            out[c] = ""
+    return out[cols]
+
+
+def build_full_day(employees, positions, relief_guide, am_surveys=True, pm_surveys=True):
+    am = build_am_schedule(employees, positions, relief_guide, surveys_needed=am_surveys)
+    pm = build_pm_schedule(employees, positions, relief_guide, am, surveys_needed=pm_surveys)
+    return am, pm
