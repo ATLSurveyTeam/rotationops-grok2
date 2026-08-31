@@ -898,10 +898,10 @@ def fill_official_docx(template_path: str, am_board: pd.DataFrame, pm_board: pd.
             return v
 
         row.cells[0].text = val(am, "Assigned Employee")
-        row.cells[1].text = val(am, "Shift")
+        row.cells[1].text = ""  # leave shift time blank for print layout
         row.cells[2].text = val(am, "Assigned Lunch")
         row.cells[4].text = val(pm, "Assigned Employee")
-        row.cells[5].text = val(pm, "Shift")
+        row.cells[5].text = ""  # leave shift time blank for print layout
         row.cells[6].text = val(pm, "Assigned Lunch")
 
     buf = BytesIO()
