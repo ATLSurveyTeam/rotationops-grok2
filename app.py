@@ -65,6 +65,7 @@ if run_button:
         employees, positions, relief,
         am_surveys=am_surveys,
         pm_surveys=pm_surveys,
+        schedule_date=selected_date,
     )
     official = build_official_sheet(am_board, pm_board, selected_date.isoformat(), leads=leads)
     show_official = official.drop(columns=["_header"], errors="ignore")

@@ -34,6 +34,64 @@ def _yes(val) -> bool:
     return _norm(val).upper() in {"Y", "YES", "TRUE", "1"}
 
 
+def _norm_pos(name: str) -> str:
+    return _norm(name).replace("–", "-").replace("—", "-").replace("  ", " ").lower()
+
+
+def strip_ampm(text: str) -> str:
+    s = _norm(text)
+    for token in (" AM", " PM", " am", " pm"):
+        if s.endswith(token.strip()) or s.upper().endswith(token.strip()):
+            pass
+    s = s.replace(" AM", "").replace(" PM", "").replace(" am", "").replace(" pm", "")
+    return s.strip()
+
+
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def is_off_on_date(days_off, schedule_date) -> bool:
+    if schedule_date is None:
+        return False
+    raw = _norm(days_off)
+    if not raw:
+        return False
+    try:
+        wd = WEEKDAYS[schedule_date.weekday()]
+    except Exception:
+        return False
+    parts = [p.strip()[:3].title() for p in raw.replace(";", ",").split(",") if p.strip()]
+    return wd in parts
+
+
+def filter_available(emp: pd.DataFrame, schedule_date) -> pd.DataFrame:
+    if schedule_date is None or "Days Off" not in emp.columns:
+        return emp
+    mask = ~emp["Days Off"].apply(lambda d: is_off_on_date(d, schedule_date))
+    return emp[mask].copy()
+
+
+def pos_key(area, name) -> tuple:
+    return (_norm(area).lower(), _norm_pos(name))
+
+
+def find_assignment(assignment: dict, cand_name: str, preferred_area: str = ""):
+    target = _norm_pos(cand_name)
+    if "rover" in target:
+        return None
+    preferred = _norm(preferred_area).lower()
+    same_area = None
+    any_match = None
+    for (area, name), rec in assignment.items():
+        if name != target:
+            continue
+        any_match = rec
+        if preferred and preferred in area:
+            same_area = rec
+            break
+    return same_area or any_match
+
+
 def pick_lunch(shift: str, counts: dict) -> str:
     options = LUNCH_BY_SHIFT.get(_norm(shift), ["12:00 PM"])
     best = min(options, key=lambda t: counts.get(t, 0))
@@ -89,6 +147,7 @@ def build_am_schedule(
     positions: pd.DataFrame,
     relief_guide: pd.DataFrame,
     surveys_needed: bool = True,
+    schedule_date=None,
 ) -> pd.DataFrame:
     emp = employees.copy()
     pos = positions.copy()
@@ -98,8 +157,9 @@ def build_am_schedule(
     pos.columns = [str(c).strip() for c in pos.columns]
     guide.columns = [str(c).strip() for c in guide.columns]
 
-    # Leads never take posts
+    # Leads never take posts; honor Days Off for the selected date
     staff = emp[~emp["Lead"].map(_yes)].copy()
+    staff = filter_available(staff, schedule_date)
 
     am_345 = staff[staff["Shift"].map(_norm) == "3:45 AM"].copy()
     am_545 = staff[staff["Shift"].map(_norm) == "5:45 AM"].copy()
@@ -142,7 +202,7 @@ def build_am_schedule(
 
         is_survey = "survey" in area.lower() or "surveyor" in pname.lower()
         if is_survey and not surveys_needed:
-            assignment[pname] = {
+            assignment[pos_key(area, pname)] = {
                 "Pos #": display,
                 "Area": area,
                 "Position Name": pname,
@@ -193,7 +253,7 @@ def build_am_schedule(
             notes = "Optional / zone fill"
 
         if person is None:
-            assignment[pname] = {
+            assignment[pos_key(area, pname)] = {
                 "Pos #": display,
                 "Area": area,
                 "Position Name": pname,
@@ -208,7 +268,7 @@ def build_am_schedule(
             continue
 
         lunch = pick_lunch(shift, lunch_counts)
-        assignment[pname] = {
+        assignment[pos_key(area, pname)] = {
             "Pos #": display,
             "Area": area,
             "Position Name": pname,
@@ -222,10 +282,10 @@ def build_am_schedule(
             "Notes": notes,
         }
 
-    staff_for_rovers = emp[~emp["Lead"].map(_yes)].copy()
+    staff_for_rovers = staff.copy()
     am_rovers = assign_rovers(staff_for_rovers, used, ["3:45 AM", "5:45 AM"], lunch_counts, "AM")
     for r in am_rovers:
-        assignment[r["Position Name"]] = r
+        assignment[pos_key("Rover / Relief Pool", r["Position Name"])] = r
 
     # Relief lookup by position name
     relief_map = {}
@@ -239,7 +299,8 @@ def build_am_schedule(
     rows = []
     for _, p in pos.sort_values("Display Order").iterrows():
         pname = _norm(p["Position"])
-        rec = dict(assignment.get(pname, {}))
+        area = _norm(p.get("Area"))
+        rec = dict(assignment.get(pos_key(area, pname), {}))
         if not rec:
             continue
 
@@ -268,7 +329,7 @@ def build_am_schedule(
         found = False
         for cand_pos in candidates:
             if "rover" in cand_pos.lower():
-                rover_list = [v for k, v in assignment.items() if str(k).startswith("Rover")]
+                rover_list = [v for v in assignment.values() if str(v.get("Position Name","")).startswith("Rover")]
                 rover = _pick_named_rover(rover_list, primary_lunch)
                 if rover is not None:
                     rec["Break Relief Agent"] = rover.get("Assigned Employee", "")
@@ -277,7 +338,7 @@ def build_am_schedule(
                     rec["Status"] = "OK — Rover"
                     found = True
                     break
-            other = assignment.get(cand_pos)
+            other = find_assignment(assignment, cand_pos, area)
             if not other:
                 continue
             other_name = other.get("Assigned Employee", "")
@@ -349,19 +410,27 @@ def build_pm_schedule(
     relief_guide: pd.DataFrame,
     am_board: pd.DataFrame,
     surveys_needed: bool = True,
+    schedule_date=None,
 ) -> pd.DataFrame:
     emp = employees.copy()
     pos = positions.copy()
     staff = emp[~emp["Lead"].map(_yes)].copy()
+    staff = filter_available(staff, schedule_date)
 
     pm_1215 = staff[staff["Shift"].map(_norm) == "12:15 PM"].copy()
     pm_200 = staff[staff["Shift"].map(_norm) == "2:00 PM"].copy()
 
     used = set()
     lunch_counts = defaultdict(int)
-    am_by_name = {
-        _norm(r["Position Name"]): r for _, r in am_board.iterrows()
-    }
+    def am_lookup(area, pname):
+        target = _norm_pos(pname)
+        area_l = _norm(area).lower()
+        for _, r in am_board.iterrows():
+            if _norm_pos(r.get("Position Name","")) != target:
+                continue
+            if _norm(r.get("Area")).lower() == area_l:
+                return r
+        return {}
 
     def take_eligible(pool: pd.DataFrame, position_name: str):
         for idx, row in pool.iterrows():
@@ -383,7 +452,7 @@ def build_pm_schedule(
         tier = _norm(p.get("Legacy Tier"))
         display = p.get("Display Order")
         handoff = _norm(p.get("PM Handoff"))
-        am_row = am_by_name.get(pname, {})
+        am_row = am_lookup(area, pname)
         am_shift = _norm(am_row.get("Shift", ""))
         am_name = _norm(am_row.get("Assigned Employee", ""))
 
@@ -391,7 +460,7 @@ def build_pm_schedule(
         wanted = _handoff_shift(handoff, am_shift)
 
         if wanted == "NOT STAFFED":
-            assignment[pname] = {
+            assignment[pos_key(area, pname)] = {
                 "Pos #": display, "Area": area, "Position Name": pname, "Tier": tier,
                 "PM Handoff Rule": handoff, "Assigned Employee": "NOT STAFFED",
                 "Shift": "", "Assigned Lunch": "", "Status": "NOT STAFFED PM",
@@ -400,7 +469,7 @@ def build_pm_schedule(
             continue
 
         if is_survey and not surveys_needed:
-            assignment[pname] = {
+            assignment[pos_key(area, pname)] = {
                 "Pos #": display, "Area": area, "Position Name": pname, "Tier": tier or "Survey",
                 "PM Handoff Rule": handoff, "Assigned Employee": "NOT NEEDED",
                 "Shift": "", "Assigned Lunch": "", "Status": "SURVEYS OFF",
@@ -431,7 +500,7 @@ def build_pm_schedule(
                     shift = "12:15 PM"
 
         if person is None:
-            assignment[pname] = {
+            assignment[pos_key(area, pname)] = {
                 "Pos #": display, "Area": area, "Position Name": pname, "Tier": tier,
                 "PM Handoff Rule": handoff, "Assigned Employee": "UNFILLED",
                 "Shift": "", "Assigned Lunch": "", "Status": "UNFILLED",
@@ -440,7 +509,7 @@ def build_pm_schedule(
             continue
 
         lunch = pick_lunch(shift, lunch_counts)
-        assignment[pname] = {
+        assignment[pos_key(area, pname)] = {
             "Pos #": display, "Area": area, "Position Name": pname, "Tier": tier,
             "PM Handoff Rule": handoff,
             "Assigned Employee": _norm(person["Employee Name"]),
@@ -449,10 +518,10 @@ def build_pm_schedule(
             "Notes": f"Handoff from {am_name} ({am_shift})" if am_name else handoff,
         }
 
-    staff_for_rovers = emp[~emp["Lead"].map(_yes)].copy()
+    staff_for_rovers = staff.copy()
     pm_rovers = assign_rovers(staff_for_rovers, used, ["12:15 PM", "2:00 PM"], lunch_counts, "PM")
     for r in pm_rovers:
-        assignment[r["Position Name"]] = r
+        assignment[pos_key("Rover / Relief Pool", r["Position Name"])] = r
 
     relief_map = {}
     for _, row in relief_guide.iterrows():
@@ -465,7 +534,8 @@ def build_pm_schedule(
     rows = []
     for _, p in pos.iterrows():
         pname = _norm(p["Position"])
-        rec = dict(assignment.get(pname, {}))
+        area = _norm(p.get("Area"))
+        rec = dict(assignment.get(pos_key(area, pname), {}))
         if not rec:
             continue
         if rec.get("Assigned Employee") in {"UNFILLED", "NOT NEEDED", "NOT STAFFED"}:
@@ -496,7 +566,7 @@ def build_pm_schedule(
                     rec["Status"] = "OK — Rover"
                     found = True
                     break
-            other = assignment.get(cand_pos)
+            other = find_assignment(assignment, cand_pos, area)
             if not other:
                 continue
             other_name = other.get("Assigned Employee", "")
@@ -534,9 +604,9 @@ def build_pm_schedule(
     return out[cols]
 
 
-def build_full_day(employees, positions, relief_guide, am_surveys=True, pm_surveys=True):
-    am = build_am_schedule(employees, positions, relief_guide, surveys_needed=am_surveys)
-    pm = build_pm_schedule(employees, positions, relief_guide, am, surveys_needed=pm_surveys)
+def build_full_day(employees, positions, relief_guide, am_surveys=True, pm_surveys=True, schedule_date=None):
+    am = build_am_schedule(employees, positions, relief_guide, surveys_needed=am_surveys, schedule_date=schedule_date)
+    pm = build_pm_schedule(employees, positions, relief_guide, am, surveys_needed=pm_surveys, schedule_date=schedule_date)
     return am, pm
 
 
@@ -795,10 +865,6 @@ def build_official_sheet(am_board, pm_board, schedule_date, leads=""):
     return df
 
 
-def _norm_pos(name: str) -> str:
-    return _norm(name).replace("–", "-").replace("—", "-").replace("  ", " ").lower()
-
-
 def _board_index(board: pd.DataFrame):
     idx = {}
     for _, r in board.iterrows():
@@ -898,11 +964,11 @@ def fill_official_docx(template_path: str, am_board: pd.DataFrame, pm_board: pd.
             return v
 
         row.cells[0].text = val(am, "Assigned Employee")
-        row.cells[1].text = ""  # leave shift time blank for print layout
-        row.cells[2].text = val(am, "Assigned Lunch")
+        row.cells[1].text = strip_ampm(val(am, "Shift"))
+        row.cells[2].text = strip_ampm(val(am, "Assigned Lunch"))
         row.cells[4].text = val(pm, "Assigned Employee")
-        row.cells[5].text = ""  # leave shift time blank for print layout
-        row.cells[6].text = val(pm, "Assigned Lunch")
+        row.cells[5].text = strip_ampm(val(pm, "Shift"))
+        row.cells[6].text = strip_ampm(val(pm, "Assigned Lunch"))
 
     buf = BytesIO()
     doc.save(buf)
